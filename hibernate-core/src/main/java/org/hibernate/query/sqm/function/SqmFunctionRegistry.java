@@ -38,15 +38,45 @@ import static org.hibernate.query.sqm.produce.function.StandardFunctionReturnTyp
 @SuppressWarnings("UnusedReturnValue")
 public class SqmFunctionRegistry {
 
+	/**
+	 * Factory interface for lazy function registration. Implementations
+	 * create and register a function descriptor on demand when the function
+	 * is first looked up. The factory is expected to call
+	 * {@link #register(String, SqmFunctionDescriptor)} internally.
+	 * <p>
+	 * A single {@code LazyFunctionFactory} instance can be shared across many
+	 * registrations to avoid creating per-function lambda classes at startup.
+	 *
+	 * @see #registerLazy(LazyFunctionFactory, FunctionName...)
+	 */
+	public interface LazyFunctionFactory {
+		/**
+		 * Create and register the function descriptor for the given function name.
+		 *
+		 * @param functionName the name of the function to create
+		 */
+		void createFunction(FunctionName functionName);
+	}
+
+	private record LazyEntry(FunctionName functionName, LazyFunctionFactory factory) {}
+
 	private final CaseInsensitiveDictionary<SqmFunctionDescriptor> functionMap = new CaseInsensitiveDictionary<>();
 	private final CaseInsensitiveDictionary<SqmSetReturningFunctionDescriptor> setReturningFunctionMap = new CaseInsensitiveDictionary<>();
 	private final CaseInsensitiveDictionary<String> alternateKeyMap = new CaseInsensitiveDictionary<>();
+	private final CaseInsensitiveDictionary<LazyEntry> lazyFactoryMap = new CaseInsensitiveDictionary<>();
+
+
 
 	public SqmFunctionRegistry() {
 	}
 
 	public Set<String> getValidFunctionKeys() {
-		return functionMap.unmodifiableKeySet();
+		if ( lazyFactoryMap.unmodifiableKeySet().isEmpty() ) {
+			return functionMap.unmodifiableKeySet();
+		}
+		final var keys = new HashSet<>( functionMap.unmodifiableKeySet() );
+		keys.addAll( lazyFactoryMap.unmodifiableKeySet() );
+		return keys;
 	}
 
 	/**
@@ -80,6 +110,7 @@ public class SqmFunctionRegistry {
 	/**
 	 * Find a {@link SqmFunctionDescriptor} by name.
 	 * Returns {@code null} if no such function is found.
+	 * Lazy entries are promoted to eager on first lookup.
 	 */
 	public @Nullable SqmFunctionDescriptor findFunctionDescriptor(String functionName) {
 		final String alternateKeyResolution = alternateKeyMap.get( functionName );
@@ -88,8 +119,29 @@ public class SqmFunctionRegistry {
 			if ( function != null ) {
 				return function;
 			}
+			// Check if the alternate key target is lazy
+			final var lazyFunction = promoteLazyFunction( alternateKeyResolution );
+			if ( lazyFunction != null ) {
+				return lazyFunction;
+			}
 		}
-		return functionMap.get( functionName );
+		final var function = functionMap.get( functionName );
+		if ( function != null ) {
+			return function;
+		}
+		return promoteLazyFunction( functionName );
+	}
+
+	private @Nullable SqmFunctionDescriptor promoteLazyFunction(String functionName) {
+		final var entry = lazyFactoryMap.get( functionName );
+		if ( entry != null ) {
+			lazyFactoryMap.remove( functionName );
+			entry.factory().createFunction( entry.functionName() );
+			// The factory registers the descriptor via register() which
+			// puts it directly in functionMap — look it up from there
+			return functionMap.get( functionName );
+		}
+		return null;
 	}
 
 	/**
@@ -149,6 +201,63 @@ public class SqmFunctionRegistry {
 		setReturningFunctionMap.put( registrationKey, function );
 		alternateKeyMap.remove( registrationKey );
 		return function;
+	}
+
+	/**
+	 * Register a function descriptor lazily by name. The factory's
+	 * {@link LazyFunctionFactory#createFunction(String)} is invoked on the first
+	 * call to {@link #findFunctionDescriptor(String)} for this name, and the
+	 * result is promoted to eager registration. This defers class loading,
+	 * type resolution, and object construction until the function is actually needed.
+	 * <p>
+	 * A single {@link LazyFunctionFactory} instance can be shared across many
+	 * registrations to avoid creating per-function lambda classes at startup.
+	 *
+	 * @param registrationKey the name under which the function will be available
+	 * @param factory the factory that creates the descriptor on first access
+	 */
+	public void registerLazy(String registrationKey, LazyFunctionFactory factory) {
+		final var name = new FunctionName() {
+			@Override
+			public String lowerCaseName() {
+				return registrationKey.toLowerCase( java.util.Locale.ROOT );
+			}
+			@Override
+			public CommonFunction function() {
+				return CommonFunction.UNKNOWN;
+			}
+		};
+		lazyFactoryMap.put( registrationKey, new LazyEntry( name, factory ) );
+		alternateKeyMap.remove( registrationKey );
+	}
+
+	/**
+	 * Register multiple function descriptors lazily, all handled by the same factory.
+	 * The {@link FunctionName} instances provide both the registration key and the
+	 * type-safe identity passed to the factory on first lookup.
+	 *
+	 * @param factory the factory that creates descriptors on first access
+	 * @param functionNames the function names to register lazily
+	 */
+	public void registerLazy(LazyFunctionFactory factory, FunctionName... functionNames) {
+		for ( FunctionName name : functionNames ) {
+			lazyFactoryMap.put( name.lowerCaseName(), new LazyEntry( name, factory ) );
+			alternateKeyMap.remove( name.lowerCaseName() );
+		}
+	}
+
+	/**
+	 * Register multiple function descriptors lazily from a collection,
+	 * all handled by the same factory. Useful with {@link CommonFunction#all()}.
+	 *
+	 * @param factory the factory that creates descriptors on first access
+	 * @param functionNames the function names to register lazily
+	 */
+	public void registerLazy(LazyFunctionFactory factory, Iterable<? extends FunctionName> functionNames) {
+		for ( FunctionName name : functionNames ) {
+			lazyFactoryMap.put( name.lowerCaseName(), new LazyEntry( name, factory ) );
+			alternateKeyMap.remove( name.lowerCaseName() );
+		}
 	}
 
 	/**
@@ -389,7 +498,10 @@ public class SqmFunctionRegistry {
 	}
 
 	public void registerAlternateKey(String alternateKey, String mappedKey) {
-		assert functionMap.containsKey( mappedKey );
+		assert functionMap.containsKey( mappedKey )
+				|| lazyFactoryMap.containsKey( mappedKey )
+				|| setReturningFunctionMap.containsKey( mappedKey )
+				: "No function registered for key: " + mappedKey;
 		alternateKeyMap.put( alternateKey, mappedKey );
 	}
 
@@ -593,10 +705,13 @@ public class SqmFunctionRegistry {
 	public void retainOnly(Set<String> functionNames) {
 		functionMap.retainAll( functionNames );
 		setReturningFunctionMap.retainAll( functionNames );
+		lazyFactoryMap.retainAll( functionNames );
 		// Retain alternate keys whose target function survived pruning
 		final var keysToRemove = new HashSet<String>();
 		alternateKeyMap.forEach( (alias, target) -> {
-			if ( !functionMap.containsKey( target ) && !setReturningFunctionMap.containsKey( target ) ) {
+			if ( !functionMap.containsKey( target )
+					&& !setReturningFunctionMap.containsKey( target )
+					&& !lazyFactoryMap.containsKey( target ) ) {
 				keysToRemove.add( alias );
 			}
 		} );
@@ -606,5 +721,6 @@ public class SqmFunctionRegistry {
 	public void close() {
 		functionMap.clear();
 		alternateKeyMap.clear();
+		lazyFactoryMap.clear();
 	}
 }

@@ -5,6 +5,7 @@
 package org.hibernate.query.sqm.function;
 
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -13,6 +14,7 @@ import org.mockito.Mockito;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class SqmFunctionRegistryTest {
@@ -166,5 +168,251 @@ class SqmFunctionRegistryTest {
 		assertNotNull( registry.findFunctionDescriptor( "count" ) );
 		assertNull( registry.findFunctionDescriptor( "sum" ) );
 		assertNull( registry.findFunctionDescriptor( "avg" ) );
+	}
+
+	// --- Lazy registration tests ---
+
+	/**
+	 * Helper: creates a LazyFunctionFactory that registers a mock descriptor
+	 * and counts how many times it was called.
+	 */
+	private SqmFunctionRegistry.LazyFunctionFactory countingFactory(
+			AtomicInteger callCount, SqmFunctionDescriptor descriptor) {
+		return name -> {
+			callCount.incrementAndGet();
+			registry.register( name.lowerCaseName(), descriptor );
+		};
+	}
+
+	@Test
+	void registerLazy_notInstantiatedUntilLookup() {
+		AtomicInteger callCount = new AtomicInteger( 0 );
+		SqmFunctionDescriptor lazyFn = Mockito.mock( SqmFunctionDescriptor.class );
+
+		registry.registerLazy( "lazy_func", countingFactory( callCount, lazyFn ) );
+
+		// Factory should not be called yet
+		assertEquals( 0, callCount.get() );
+
+		// Lookup should trigger factory
+		SqmFunctionDescriptor result = registry.findFunctionDescriptor( "lazy_func" );
+		assertSame( lazyFn, result );
+		assertEquals( 1, callCount.get() );
+	}
+
+	@Test
+	void registerLazy_promotedToEagerAfterFirstLookup() {
+		AtomicInteger callCount = new AtomicInteger( 0 );
+		SqmFunctionDescriptor lazyFn = Mockito.mock( SqmFunctionDescriptor.class );
+
+		registry.registerLazy( "lazy_func", countingFactory( callCount, lazyFn ) );
+
+		// First lookup triggers factory
+		registry.findFunctionDescriptor( "lazy_func" );
+		assertEquals( 1, callCount.get() );
+
+		// Second lookup should NOT call factory again (promoted to eager)
+		SqmFunctionDescriptor result = registry.findFunctionDescriptor( "lazy_func" );
+		assertSame( lazyFn, result );
+		assertEquals( 1, callCount.get() );
+	}
+
+	@Test
+	void registerLazy_includedInValidFunctionKeys() {
+		SqmFunctionDescriptor lazyFn = Mockito.mock( SqmFunctionDescriptor.class );
+		registry.registerLazy( "lazy_func", name -> registry.register( name.lowerCaseName(), lazyFn ) );
+
+		assertTrue( registry.getValidFunctionKeys().contains( "lazy_func" ) );
+	}
+
+	@Test
+	void registerLazy_eagerTakesPrecedence() {
+		SqmFunctionDescriptor eagerFn = Mockito.mock( SqmFunctionDescriptor.class );
+		SqmFunctionDescriptor lazyFn = Mockito.mock( SqmFunctionDescriptor.class );
+
+		registry.register( "func", eagerFn );
+		registry.registerLazy( "func", name -> registry.register( name.lowerCaseName(), lazyFn ) );
+
+		// Eager registration should win (since find checks eager map first)
+		assertSame( eagerFn, registry.findFunctionDescriptor( "func" ) );
+	}
+
+	@Test
+	void registerLazy_alternateKeyResolvesLazyTarget() {
+		SqmFunctionDescriptor lazyFn = Mockito.mock( SqmFunctionDescriptor.class );
+
+		registry.registerLazy( "char_length", name -> registry.register( name.lowerCaseName(), lazyFn ) );
+		registry.registerAlternateKey( "length", "char_length" );
+
+		// Looking up the alias should trigger lazy promotion of the target
+		SqmFunctionDescriptor result = registry.findFunctionDescriptor( "length" );
+		assertSame( lazyFn, result );
+
+		// Direct lookup should also work (now promoted)
+		assertSame( lazyFn, registry.findFunctionDescriptor( "char_length" ) );
+	}
+
+	@Test
+	void registerLazy_retainOnlyKeepsLazyEntries() {
+		SqmFunctionDescriptor keptFn = Mockito.mock( SqmFunctionDescriptor.class );
+		SqmFunctionDescriptor prunedFn = Mockito.mock( SqmFunctionDescriptor.class );
+
+		registry.registerLazy( "lazy_kept", name -> registry.register( name.lowerCaseName(), keptFn ) );
+		registry.registerLazy( "lazy_pruned", name -> registry.register( name.lowerCaseName(), prunedFn ) );
+
+		registry.retainOnly( Set.of( "count", "lazy_kept" ) );
+
+		assertNotNull( registry.findFunctionDescriptor( "count" ) );
+		assertNotNull( registry.findFunctionDescriptor( "lazy_kept" ) );
+		assertNull( registry.findFunctionDescriptor( "lazy_pruned" ) );
+	}
+
+	@Test
+	void registerLazy_mixedEagerAndLazy() {
+		SqmFunctionDescriptor lazyFn = Mockito.mock( SqmFunctionDescriptor.class );
+
+		registry.registerLazy( "lazy_func", name -> registry.register( name.lowerCaseName(), lazyFn ) );
+
+		// Eager functions still work
+		assertNotNull( registry.findFunctionDescriptor( "count" ) );
+		assertNotNull( registry.findFunctionDescriptor( "sum" ) );
+
+		// Lazy function works
+		assertSame( lazyFn, registry.findFunctionDescriptor( "lazy_func" ) );
+
+		// Total key count includes both
+		assertTrue( registry.getValidFunctionKeys().contains( "count" ) );
+		assertTrue( registry.getValidFunctionKeys().contains( "lazy_func" ) );
+	}
+
+	@Test
+	void registerLazy_sharedFactoryForMultipleFunctions() {
+		AtomicInteger callCount = new AtomicInteger( 0 );
+		SqmFunctionDescriptor sinFn = Mockito.mock( SqmFunctionDescriptor.class );
+		SqmFunctionDescriptor cosFn = Mockito.mock( SqmFunctionDescriptor.class );
+
+		// A single factory instance shared across registrations (like CommonFunctionFactory)
+		SqmFunctionRegistry.LazyFunctionFactory sharedFactory = name -> {
+			callCount.incrementAndGet();
+			switch ( name.lowerCaseName() ) {
+				case "sin" -> registry.register( name.lowerCaseName(), sinFn );
+				case "cos" -> registry.register( name.lowerCaseName(), cosFn );
+			}
+		};
+
+		registry.registerLazy( "sin", sharedFactory );
+		registry.registerLazy( "cos", sharedFactory );
+
+		assertEquals( 0, callCount.get() );
+
+		// Looking up "sin" should only trigger factory for "sin"
+		assertSame( sinFn, registry.findFunctionDescriptor( "sin" ) );
+		assertEquals( 1, callCount.get() );
+
+		// Looking up "cos" should trigger factory for "cos"
+		assertSame( cosFn, registry.findFunctionDescriptor( "cos" ) );
+		assertEquals( 2, callCount.get() );
+
+		// Second lookup of "sin" should not trigger factory again
+		assertSame( sinFn, registry.findFunctionDescriptor( "sin" ) );
+		assertEquals( 2, callCount.get() );
+	}
+
+	@Test
+	void registerLazy_varargsBulkRegistration() {
+		AtomicInteger callCount = new AtomicInteger( 0 );
+		SqmFunctionDescriptor sinFn = Mockito.mock( SqmFunctionDescriptor.class );
+		SqmFunctionDescriptor cosFn = Mockito.mock( SqmFunctionDescriptor.class );
+		SqmFunctionDescriptor tanFn = Mockito.mock( SqmFunctionDescriptor.class );
+
+		SqmFunctionRegistry.LazyFunctionFactory factory = name -> {
+			callCount.incrementAndGet();
+			switch ( name.lowerCaseName() ) {
+				case "sin" -> registry.register( name.lowerCaseName(), sinFn );
+				case "cos" -> registry.register( name.lowerCaseName(), cosFn );
+				case "tan" -> registry.register( name.lowerCaseName(), tanFn );
+			}
+		};
+
+		// Bulk registration via single-name calls
+		registry.registerLazy( "sin", factory );
+		registry.registerLazy( "cos", factory );
+		registry.registerLazy( "tan", factory );
+
+		// All names should be in valid keys
+		assertTrue( registry.getValidFunctionKeys().contains( "sin" ) );
+		assertTrue( registry.getValidFunctionKeys().contains( "cos" ) );
+		assertTrue( registry.getValidFunctionKeys().contains( "tan" ) );
+
+		// Factory should not be called yet
+		assertEquals( 0, callCount.get() );
+
+		// Each lookup triggers factory independently
+		assertSame( sinFn, registry.findFunctionDescriptor( "sin" ) );
+		assertEquals( 1, callCount.get() );
+
+		assertSame( tanFn, registry.findFunctionDescriptor( "tan" ) );
+		assertEquals( 2, callCount.get() );
+
+		// "cos" still lazy, not yet triggered
+		assertSame( cosFn, registry.findFunctionDescriptor( "cos" ) );
+		assertEquals( 3, callCount.get() );
+	}
+
+	@Test
+	void registerLazy_commonFunctionEnum() {
+		AtomicInteger callCount = new AtomicInteger( 0 );
+		SqmFunctionDescriptor cotFn = Mockito.mock( SqmFunctionDescriptor.class );
+		SqmFunctionDescriptor piFn = Mockito.mock( SqmFunctionDescriptor.class );
+
+		SqmFunctionRegistry.LazyFunctionFactory factory = name -> {
+			callCount.incrementAndGet();
+			registry.register( name.lowerCaseName(), name.function() == CommonFunction.COT ? cotFn : piFn );
+		};
+
+		// Register using CommonFunction enum constants
+		registry.registerLazy( factory, CommonFunction.COT, CommonFunction.PI );
+
+		assertEquals( 0, callCount.get() );
+		assertTrue( registry.getValidFunctionKeys().contains( "cot" ) );
+		assertTrue( registry.getValidFunctionKeys().contains( "pi" ) );
+
+		// Lookup triggers factory with correct FunctionName
+		assertSame( cotFn, registry.findFunctionDescriptor( "cot" ) );
+		assertEquals( 1, callCount.get() );
+
+		assertSame( piFn, registry.findFunctionDescriptor( "pi" ) );
+		assertEquals( 2, callCount.get() );
+	}
+
+	@Test
+	void registerLazy_commonFunctionAll() {
+		SqmFunctionDescriptor mockFn = Mockito.mock( SqmFunctionDescriptor.class );
+
+		SqmFunctionRegistry.LazyFunctionFactory factory = name ->
+				registry.register( name.lowerCaseName(), mockFn );
+
+		// Register all common functions at once
+		registry.registerLazy( factory, CommonFunction.all() );
+
+		// All common functions should be in valid keys
+		for ( CommonFunction cf : CommonFunction.all() ) {
+			assertTrue( registry.getValidFunctionKeys().contains( cf.lowerCaseName() ),
+					cf.lowerCaseName() + " should be in valid keys" );
+		}
+
+		// UNKNOWN should not be registered
+		assertTrue( !registry.getValidFunctionKeys().contains( "unknown" ) );
+	}
+
+	@Test
+	void registerLazy_closeClears() {
+		SqmFunctionDescriptor lazyFn = Mockito.mock( SqmFunctionDescriptor.class );
+		registry.registerLazy( "lazy_func", name -> registry.register( name.lowerCaseName(), lazyFn ) );
+
+		registry.close();
+
+		assertNull( registry.findFunctionDescriptor( "lazy_func" ) );
+		assertNull( registry.findFunctionDescriptor( "count" ) );
 	}
 }

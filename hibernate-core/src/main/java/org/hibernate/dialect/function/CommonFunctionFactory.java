@@ -40,6 +40,8 @@ import org.hibernate.dialect.function.xml.XmlForestFunction;
 import org.hibernate.dialect.function.xml.XmlPiFunction;
 import org.hibernate.dialect.function.xml.XmlQueryFunction;
 import org.hibernate.dialect.function.xml.XmlTableFunction;
+import org.hibernate.query.sqm.function.CommonFunction;
+import org.hibernate.query.sqm.function.FunctionName;
 import org.hibernate.query.sqm.function.SqmFunctionRegistry;
 import org.hibernate.query.sqm.produce.function.ArgumentTypesValidator;
 import org.hibernate.query.sqm.produce.function.FunctionParameterType;
@@ -67,7 +69,7 @@ import static org.hibernate.sql.ast.SqlAstNodeRenderingMode.NO_PLAIN_PARAMETER;
  * @author Gavin King
  * @author Yoobin Yoon
  */
-public class CommonFunctionFactory {
+public class CommonFunctionFactory implements SqmFunctionRegistry.LazyFunctionFactory {
 
 	private final BasicType<Boolean> booleanType;
 	private final BasicType<Character> characterType;
@@ -98,6 +100,143 @@ public class CommonFunctionFactory {
 		binaryType = basicTypeRegistry.resolve(StandardBasicTypes.BINARY);
 		integerType = basicTypeRegistry.resolve(StandardBasicTypes.INTEGER);
 		doubleType = basicTypeRegistry.resolve(StandardBasicTypes.DOUBLE);
+	}
+
+	/**
+	 * Implements {@link SqmFunctionRegistry.LazyFunctionFactory} for common
+	 * function registration. Dispatches from {@link CommonFunction} enum
+	 * constants to the corresponding registration method, providing
+	 * compile-time exhaustiveness checking.
+	 * <p>
+	 * Methods that register multiple function names (e.g.,
+	 * {@link #moreHyperbolic()} registers acosh, asinh, atanh) will register
+	 * all names when any one is first looked up.
+	 * <p>
+	 * Parameterized methods (those requiring dialect-specific arguments like
+	 * version flags or SQL patterns) are not handled here — dialects must
+	 * provide their own {@link SqmFunctionRegistry.LazyFunctionFactory} for those.
+	 */
+	@Override
+	public void createFunction(FunctionName functionName) {
+		switch ( functionName.function() ) {
+			// trigonometric / geometric
+			case COT -> cot();
+			case RADIANS -> radians();
+			case DEGREES -> degrees();
+			case LOG -> log();
+			case LOG10 -> log10();
+			case TANH -> tanh();
+			case SINH -> sinh();
+			case COSH -> cosh();
+			case ACOSH, ASINH, ATANH -> moreHyperbolic();
+			case CBRT -> cbrt();
+			case PI -> pi();
+
+			// string functions
+			case LTRIM, RTRIM -> trim2();
+			case REPEAT -> repeat();
+			case INITCAP -> initcap();
+			case SUBSTR -> substr();
+			case SUBSTRING -> substring_substr();
+			case REVERSE -> reverse();
+			case TRANSLATE -> translate();
+			case SOUNDEX -> soundex();
+			case ASCII -> ascii();
+			case CHR -> char_chr();
+			case POSITION -> position();
+			case LOCATE -> locate_positionSubstring();
+			case MOD -> mod_operator();
+
+			// numeric conversion
+			case TO_NUMBER, TO_CHAR, TO_DATE, TO_TIMESTAMP -> toCharNumberDateTimestamp();
+
+			// bitwise operators
+			case BITAND, BITOR, BITXOR, BITNOT -> bitandorxornot_operator();
+
+			// bitwise aggregate functions
+			case BIT_AND, BIT_OR -> bitAndOr();
+
+			// boolean aggregate functions
+			case BOOL_AND, BOOL_OR -> everyAny_boolAndOr();
+
+			// statistical aggregates
+			case CORR -> corr();
+			case REGR_AVGX, REGR_AVGY, REGR_COUNT, REGR_INTERCEPT,
+				REGR_R2, REGR_SLOPE, REGR_SXX, REGR_SXY, REGR_SYY
+					-> regrLinearRegressionAggregates();
+
+			// window functions
+			case ROW_NUMBER, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE
+					-> windowFunctions();
+
+			// aggregate
+			case LISTAGG -> listagg_stringAgg( "varchar" );
+
+			// date/time
+			case LOCALTIME, LOCALTIMESTAMP, LOCAL_TIME, LOCAL_DATETIME
+					-> localtimeLocaltimestamp();
+			case MEDIAN -> median_percentileCont( false );
+			case STDDEV -> stddev();
+			case STDDEV_POP, STDDEV_SAMP -> stddevPopSamp();
+			case VARIANCE -> variance();
+			case VAR_POP, VAR_SAMP -> varPopSamp();
+			case COVAR_POP, COVAR_SAMP -> covarPopSamp();
+			case INSERT -> insert_overlay();
+			case OVERLAY -> overlay();
+			case MAKE_DATE, MAKE_TIME, MAKE_TIMESTAMP, MAKE_TIMESTAMPTZ
+					-> makeDateTimeTimestamp();
+			case MODE, PERCENTILE_CONT, PERCENTILE_DISC
+					-> inverseDistributionOrderedSetAggregates();
+			case RANK, DENSE_RANK, PERCENT_RANK, CUME_DIST
+					-> hypotheticalOrderedSetAggregates();
+			case DATE_TRUNC -> dateTrunc();
+
+			// XML
+			case XMLELEMENT -> xmlelement();
+			case XMLCOMMENT -> xmlcomment();
+			case XMLFOREST -> xmlforest();
+			case XMLCONCAT -> xmlconcat();
+			case XMLPI -> xmlpi();
+			case XMLQUERY -> xmlquery_postgresql();
+			case XMLEXISTS -> xmlexists();
+			case XMLAGG -> xmlagg();
+
+			// Array functions
+			case ARRAY, ARRAY_LIST -> array_postgresql();
+			case ARRAY_AGG -> arrayAggregate();
+			case ARRAY_POSITION -> arrayPosition_postgresql();
+			case ARRAY_POSITIONS, ARRAY_POSITIONS_LIST -> arrayPositions_postgresql();
+			case ARRAY_LENGTH -> arrayLength_cardinality();
+			case ARRAY_CONCAT -> arrayConcat_postgresql();
+			case ARRAY_PREPEND -> arrayPrepend_postgresql();
+			case ARRAY_APPEND -> arrayAppend_postgresql();
+			case ARRAY_CONTAINS, ARRAY_CONTAINS_NULLABLE,
+				ARRAY_INCLUDES, ARRAY_INCLUDES_NULLABLE
+					-> arrayContains_postgresql();
+			case ARRAY_INTERSECTS, ARRAY_INTERSECTS_NULLABLE
+					-> arrayIntersects_postgresql();
+			case ARRAY_GET -> arrayGet_bracket();
+			case ARRAY_SET -> arraySet_unnest();
+			case ARRAY_REMOVE -> arrayRemove();
+			case ARRAY_REMOVE_INDEX -> arrayRemoveIndex_unnest( true );
+			case ARRAY_SLICE -> arraySlice_operator();
+			case ARRAY_REPLACE -> arrayReplace();
+			case ARRAY_TRIM -> arrayTrim_trim_array();
+			case ARRAY_FILL, ARRAY_FILL_LIST -> arrayFill_postgresql();
+			case ARRAY_TO_STRING -> arrayToString_postgresql();
+
+			// JSON mutation (version-independent)
+			case JSON_SET -> jsonSet_postgresql();
+			case JSON_REMOVE -> jsonRemove_postgresql();
+			case JSON_REPLACE -> jsonReplace_postgresql();
+			case JSON_INSERT -> jsonInsert_postgresql();
+			case JSON_MERGEPATCH -> jsonMergepatch_postgresql();
+			case JSON_ARRAY_APPEND -> jsonArrayAppend_postgresql( true );
+			case JSON_ARRAY_INSERT -> jsonArrayInsert_postgresql();
+
+			case UNKNOWN -> throw new IllegalArgumentException(
+					"Unknown function for lazy registration: " + functionName.lowerCaseName() );
+		}
 	}
 
 	// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -73,6 +73,7 @@ import org.hibernate.query.sqm.mutation.internal.temptable.PersistentTableInsert
 import org.hibernate.query.sqm.mutation.internal.temptable.PersistentTableMutationStrategy;
 import org.hibernate.query.sqm.mutation.spi.SqmMultiTableInsertStrategy;
 import org.hibernate.query.sqm.mutation.spi.SqmMultiTableMutationStrategy;
+import org.hibernate.query.sqm.function.SqmFunctionRegistry;
 import org.hibernate.query.sqm.produce.function.StandardFunctionArgumentTypeResolvers;
 import org.hibernate.service.ServiceRegistry;
 import org.hibernate.sql.ast.SqlAstNodeRenderingMode;
@@ -268,7 +269,7 @@ public class SpannerPostgreSQLDialect extends PostgreSQLDialect {
 	}
 
 	@Override
-	protected void registerJsonFunction(CommonFunctionFactory functionFactory) {
+	protected void registerJsonFunction(CommonFunctionFactory functionFactory, SqmFunctionRegistry functionRegistry) {
 		functionFactory.jsonObject_postgresql( false );
 		functionFactory.jsonArray_postgresql( false );
 		functionFactory.jsonSet_postgresql();
@@ -278,7 +279,7 @@ public class SpannerPostgreSQLDialect extends PostgreSQLDialect {
 	}
 
 	@Override
-	protected void registerArrayFunctions(CommonFunctionFactory functionFactory) {
+	protected void registerArrayFunctions(CommonFunctionFactory functionFactory, SqmFunctionRegistry functionRegistry) {
 		functionFactory.array_postgresql();
 		functionFactory.arrayAggregate();
 		functionFactory.arrayConcat_postgresql();
@@ -294,11 +295,14 @@ public class SpannerPostgreSQLDialect extends PostgreSQLDialect {
 	}
 
 	@Override
-	protected void registerXmlFunctions(CommonFunctionFactory functionFactory) {
+	protected void registerXmlFunctions(CommonFunctionFactory functionFactory, SqmFunctionRegistry functionRegistry) {
 	}
 
 	@Override
-	protected void registerUtilityFunctions(FunctionContributions functionContributions) {
+	protected void registerUtilityFunctions(
+			FunctionContributions functionContributions,
+			CommonFunctionFactory functionFactory,
+			SqmFunctionRegistry functionRegistry) {
 	}
 
 	@Override

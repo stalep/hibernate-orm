@@ -76,6 +76,8 @@ import org.hibernate.query.sqm.mutation.internal.cte.CteInsertStrategy;
 import org.hibernate.query.sqm.mutation.internal.cte.CteMutationStrategy;
 import org.hibernate.query.sqm.mutation.spi.SqmMultiTableInsertStrategy;
 import org.hibernate.query.sqm.mutation.spi.SqmMultiTableMutationStrategy;
+import org.hibernate.query.sqm.function.CommonFunction;
+import org.hibernate.query.sqm.function.SqmFunctionRegistry;
 import org.hibernate.query.sqm.produce.function.StandardFunctionArgumentTypeResolvers;
 import org.hibernate.service.ServiceRegistry;
 import org.hibernate.sql.ast.SqlAstTranslator;
@@ -566,71 +568,36 @@ public class PostgreSQLDialect extends Dialect {
 		super.initializeFunctionRegistry( functionContributions );
 
 		final var functionFactory = new CommonFunctionFactory( functionContributions );
+		final var functionRegistry = functionContributions.getFunctionRegistry();
 
-		functionFactory.cot();
-		functionFactory.radians();
-		functionFactory.degrees();
-		functionFactory.log();
-		functionFactory.mod_operator();
-		functionFactory.log10();
-		functionFactory.tanh();
-		functionFactory.sinh();
-		functionFactory.cosh();
-		functionFactory.moreHyperbolic();
-		functionFactory.cbrt();
-		functionFactory.pi();
-		functionFactory.trim2();
-		functionFactory.repeat();
-		functionFactory.initcap();
-		functionFactory.substr();
-		functionFactory.substring_substr();
-		//also natively supports ANSI-style substring()
-		functionFactory.reverse();
-		functionFactory.translate();
-		functionFactory.toCharNumberDateTimestamp();
+		// -- Lazy registration: all common functions are deferred until first lookup --
+		// CommonFunctionFactory implements LazyFunctionFactory, so a single object
+		// reference is shared across all registrations — no lambda classes.
+		// CommonFunction.all() provides the full list, excluding UNKNOWN.
+		functionRegistry.registerLazy( functionFactory, CommonFunction.all() );
+		functionRegistry.registerAlternateKey( "char", "chr" );
+		functionRegistry.registerAlternateKey( "every", "bool_and" );
+		functionRegistry.registerAlternateKey( "any", "bool_or" );
+
+		// -- Eager registration: parameterized functions needing dialect-specific args --
 		functionFactory.concat_pipeOperator( "convert_from(lo_get(?1),pg_client_encoding())" );
 		functionFactory.length_characterLength_pattern( "length(lo_get(?1),pg_client_encoding())" );
 		functionFactory.bitLength_pattern( "bit_length(?1)", "length(lo_get(?1))*8" );
 		functionFactory.octetLength_pattern( "octet_length(?1)", "length(lo_get(?1))" );
-		functionFactory.ascii();
-		functionFactory.char_chr();
-		functionFactory.position();
-		functionFactory.bitandorxornot_operator();
-		functionFactory.bitAndOr();
-		functionFactory.everyAny_boolAndOr();
-		functionFactory.corr();
-		functionFactory.regrLinearRegressionAggregates();
-		functionFactory.soundex(); //was introduced in Postgres 9 apparently
 
-		functionFactory.locate_positionSubstring();
-		functionFactory.windowFunctions();
-		functionFactory.listagg_stringAgg( "varchar" );
-
-		registerArrayFunctions( functionFactory );
-		registerJsonFunction( functionFactory );
-		registerXmlFunctions( functionFactory );
-		registerUtilityFunctions( functionContributions );
+		registerArrayFunctions( functionFactory, functionRegistry );
+		registerJsonFunction( functionFactory, functionRegistry );
+		registerXmlFunctions( functionFactory, functionRegistry );
+		registerUtilityFunctions( functionContributions, functionFactory, functionRegistry );
 	}
 
-	protected void registerUtilityFunctions( FunctionContributions functionContributions ) {
-		final var functionFactory = new CommonFunctionFactory( functionContributions );
-		final var functionRegistry =  functionContributions.getFunctionRegistry();
+	protected void registerUtilityFunctions(
+			FunctionContributions functionContributions,
+			CommonFunctionFactory functionFactory,
+			SqmFunctionRegistry functionRegistry) {
 
-		functionFactory.localtimeLocaltimestamp();
-
-		functionFactory.median_percentileCont( false );
-		functionFactory.stddev();
-		functionFactory.stddevPopSamp();
-		functionFactory.variance();
-		functionFactory.varPopSamp();
-		functionFactory.covarPopSamp();
-		functionFactory.insert_overlay();
-		functionFactory.overlay();
-
-		functionFactory.makeDateTimeTimestamp();
-		// Note that PostgreSQL doesn't support the OVER clause for ordered set-aggregate functions
-		functionFactory.inverseDistributionOrderedSetAggregates();
-		functionFactory.hypotheticalOrderedSetAggregates();
+		// Common functions are already lazily registered via CommonFunction.all()
+		// in initializeFunctionRegistry. Only eager/parameterized functions here.
 
 		if ( !supportsMinMaxOnUuid() ) {
 			functionRegistry.register( "min", new PostgreSQLMinMaxFunction( "min" ) );
@@ -651,88 +618,82 @@ public class PostgreSQLDialect extends Dialect {
 				new PostgreSQLTruncFunction( true, functionContributions.getTypeConfiguration() )
 		);
 		functionRegistry.registerAlternateKey( "truncate", "trunc" );
-		functionFactory.dateTrunc();
 
+		// Eager: version-parameterized and set-returning functions
 		functionFactory.unnest_postgresql( getVersion().isSameOrAfter( 17 ) );
 		functionFactory.generateSeries( null, "ordinality", false );
-
 		functionFactory.hex( "encode(?1, 'hex')" );
 		functionFactory.sha( "sha256(?1)" );
 		functionFactory.md5( "decode(md5(?1), 'hex')" );
-
 		functionFactory.regexpLike_postgresql( getVersion().isSameOrAfter( 15 ) );
 	}
 
-	protected void registerXmlFunctions(CommonFunctionFactory functionFactory) {
-		functionFactory.xmlelement();
-		functionFactory.xmlcomment();
-		functionFactory.xmlforest();
-		functionFactory.xmlconcat();
-		functionFactory.xmlpi();
-		functionFactory.xmlquery_postgresql();
-		functionFactory.xmlexists();
-		functionFactory.xmlagg();
+	protected void registerXmlFunctions(CommonFunctionFactory functionFactory, SqmFunctionRegistry functionRegistry) {
+		// Common XML functions are already lazily registered via CommonFunction.all()
+		// xmltable is set-returning — keep eager
 		functionFactory.xmltable( true );
 	}
 
-	protected void registerJsonFunction(CommonFunctionFactory functionFactory) {
-		if ( getVersion().isSameOrAfter( 17 ) ) {
-			functionFactory.jsonValue_postgresql( true );
-			functionFactory.jsonQuery();
-			functionFactory.jsonExists();
-			functionFactory.jsonObject_postgresql( true );
-			functionFactory.jsonArray_postgresql( true );
-			functionFactory.jsonArrayAgg_postgresql( true );
-			functionFactory.jsonObjectAgg_postgresql( true );
-			functionFactory.jsonTable();
-		}
-		else {
-			functionFactory.jsonValue_postgresql( false );
-			functionFactory.jsonQuery_postgresql();
-			functionFactory.jsonExists_postgresql();
-			if ( getVersion().isSameOrAfter( 16 ) ) {
-				functionFactory.jsonObject_postgresql( true );
-				functionFactory.jsonArray_postgresql( true );
-				functionFactory.jsonArrayAgg_postgresql( true );
-				functionFactory.jsonObjectAgg_postgresql( true );
+	protected void registerJsonFunction(CommonFunctionFactory functionFactory, SqmFunctionRegistry functionRegistry) {
+		// Version-dependent JSON functions: one lambda factory capturing dialect version.
+		// These are NOT in CommonFunction — they need dialect-specific version logic.
+		final boolean v17 = getVersion().isSameOrAfter( 17 );
+		final boolean v16 = getVersion().isSameOrAfter( 16 );
+		final SqmFunctionRegistry.LazyFunctionFactory jsonFactory = name -> {
+			switch ( name.lowerCaseName() ) {
+				case "json_value" -> functionFactory.jsonValue_postgresql( v17 );
+				case "json_query" -> {
+					if ( v17 ) {
+						functionFactory.jsonQuery();
+					}
+					else {
+						functionFactory.jsonQuery_postgresql();
+					}
+				}
+				case "json_exists" -> {
+					if ( v17 ) {
+						functionFactory.jsonExists();
+					}
+					else {
+						functionFactory.jsonExists_postgresql();
+					}
+				}
+				case "json_object" -> functionFactory.jsonObject_postgresql( v16 );
+				case "json_array" -> functionFactory.jsonArray_postgresql( v16 );
+				case "json_arrayagg" -> functionFactory.jsonArrayAgg_postgresql( v16 );
+				case "json_objectagg" -> functionFactory.jsonObjectAgg_postgresql( v16 );
+				case "json_table" -> {
+					if ( v17 ) {
+						functionFactory.jsonTable();
+					}
+					else {
+						functionFactory.jsonTable_postgresql();
+					}
+				}
+				default -> throw new IllegalArgumentException(
+						"Unknown JSON function for lazy registration: " + name.lowerCaseName() );
 			}
-			else {
-				functionFactory.jsonObject_postgresql( false );
-				functionFactory.jsonArray_postgresql( false );
-				functionFactory.jsonArrayAgg_postgresql( false );
-				functionFactory.jsonObjectAgg_postgresql( false );
-			}
-			functionFactory.jsonTable_postgresql();
-		}
-		functionFactory.jsonSet_postgresql();
-		functionFactory.jsonRemove_postgresql();
-		functionFactory.jsonReplace_postgresql();
-		functionFactory.jsonInsert_postgresql();
-		// Requires support for WITH clause in subquery which only 13+ provides
-		functionFactory.jsonMergepatch_postgresql();
-		functionFactory.jsonArrayAppend_postgresql( true );
-		functionFactory.jsonArrayInsert_postgresql();
+		};
+
+		functionRegistry.registerLazy( "json_value", jsonFactory );
+		functionRegistry.registerLazy( "json_query", jsonFactory );
+		functionRegistry.registerLazy( "json_exists", jsonFactory );
+		functionRegistry.registerLazy( "json_object", jsonFactory );
+		functionRegistry.registerLazy( "json_array", jsonFactory );
+		functionRegistry.registerLazy( "json_arrayagg", jsonFactory );
+		functionRegistry.registerLazy( "json_objectagg", jsonFactory );
+		functionRegistry.registerLazy( "json_table", jsonFactory );
+
+		// Version-independent JSON mutation functions are already lazily
+		// registered via CommonFunction.all() in initializeFunctionRegistry
 	}
 
-	protected void registerArrayFunctions(CommonFunctionFactory functionFactory) {
-		functionFactory.array_postgresql();
-		functionFactory.arrayAggregate();
-		functionFactory.arrayPosition_postgresql();
-		functionFactory.arrayPositions_postgresql();
-		functionFactory.arrayLength_cardinality();
-		functionFactory.arrayConcat_postgresql();
-		functionFactory.arrayPrepend_postgresql();
-		functionFactory.arrayAppend_postgresql();
-		functionFactory.arrayContains_postgresql();
-		functionFactory.arrayIntersects_postgresql();
-		functionFactory.arrayGet_bracket();
-		functionFactory.arraySet_unnest();
-		functionFactory.arrayRemove();
-		functionFactory.arrayRemoveIndex_unnest( true );
-		functionFactory.arraySlice_operator();
-		functionFactory.arrayReplace();
-		functionFactory.arrayTrim_trim_array();
+	protected void registerArrayFunctions(CommonFunctionFactory functionFactory, SqmFunctionRegistry functionRegistry) {
+		// Common array functions are already lazily registered via CommonFunction.all()
+		functionRegistry.registerAlternateKey( "array_overlaps", "array_intersects" );
+		functionRegistry.registerAlternateKey( "array_overlaps_nullable", "array_intersects_nullable" );
 
+		// Version-dependent array functions — eager
 		if ( getVersion().isSameOrAfter( 18 ) ) {
 			functionFactory.arrayReverse();
 			functionFactory.arraySort();
@@ -741,8 +702,6 @@ public class PostgreSQLDialect extends Dialect {
 			functionFactory.arrayReverse_unnest();
 			functionFactory.arraySort_unnest();
 		}
-		functionFactory.arrayFill_postgresql();
-		functionFactory.arrayToString_postgresql();
 	}
 
 	@Override
